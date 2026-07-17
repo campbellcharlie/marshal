@@ -12,14 +12,36 @@
  * Routes it into Claude Code as a single MCP server: `node /path/to/marshal.mjs`.
  */
 import { spawn } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, appendFileSync, mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { homedir } from 'node:os';
+import { createHash } from 'node:crypto';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CONFIG = process.env.MARSHAL_CONFIG || join(HERE, 'marshal.config.json');
 const backendsCfg = JSON.parse(readFileSync(CONFIG, 'utf8')).backends || [];
 const err = (m) => process.stderr.write(`[marshal] ${m}\n`);
+
+// ── audit trail ─────────────────────────────────────────────────────────────────────────────────
+// Every tool call flows through marshal's one chokepoint, so it's the place to record provenance.
+// Append-only JSONL, hash-chained (each row carries prev = sha256 of the previous LINE → tamper-evident,
+// continuing across restarts). REDACTED: we log arg KEYS + type/length, never raw values (a log of
+// values would itself be an exfil surface).
+const AUDIT = process.env.MARSHAL_AUDIT || join(homedir(), '.marshal', 'audit.jsonl');
+let lastHash = '0'.repeat(64);
+try { const ls = readFileSync(AUDIT, 'utf8').trim().split('\n').filter(Boolean); if (ls.length) lastHash = createHash('sha256').update(ls[ls.length - 1]).digest('hex'); } catch {}
+const redactArgs = (a) => (a && typeof a === 'object')
+  ? Object.entries(a).map(([k, v]) => `${k}:${Array.isArray(v) ? `array[${v.length}]` : typeof v === 'string' ? `str[${v.length}]` : typeof v}`)
+  : [];
+function audit(entry) {
+  try {
+    mkdirSync(dirname(AUDIT), { recursive: true });
+    const line = JSON.stringify({ ts: new Date().toISOString(), ...entry, prev: lastHash });
+    appendFileSync(AUDIT, line + '\n');
+    lastHash = createHash('sha256').update(line).digest('hex');
+  } catch (e) { err(`audit write failed: ${e.message}`); }
+}
 
 let clientReady = false;                                   // client finished initialize → safe to notify
 function toClient(o) { process.stdout.write(JSON.stringify(o) + '\n'); }
@@ -43,6 +65,7 @@ class Backend {
       this.pending.forEach((p) => p.reject(new Error(`backend ${this.name} restarted`)));
       this.pending.clear();
       notifyToolsChanged();                                // tools just vanished — tell the client
+      audit({ event: 'backend_exit', backend: this.name, code });
       err(`backend ${this.name} exited (code ${code}) — respawning in 300ms`);
       setTimeout(() => this.start(), 300);
     });
@@ -76,6 +99,7 @@ class Backend {
       // namespace each tool as `<backend>.<tool>`; keep the original name for routing.
       this.tools = (r.tools || []).map((t) => ({ ...t, name: `${this.name}.${t.name}`, _orig: t.name }));
       this.ready = true;
+      audit({ event: 'backend_ready', backend: this.name, tools: this.tools.length });
       err(`backend ${this.name} ready: ${this.tools.length} tools`);
       notifyToolsChanged();
     } catch (e) { err(`backend ${this.name} init failed: ${e.message}`); }
@@ -107,9 +131,16 @@ async function handle(req) {
     case 'ping': toClient({ jsonrpc: '2.0', id, result: {} }); return;
     case 'tools/call': {
       const r = route(params.name);
-      if (!r) { toClient({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: `Error: unknown tool "${params.name}" (backend down or restarting?)` }], isError: true } }); return; }
-      try { toClient({ jsonrpc: '2.0', id, result: await r.b.callTool(r.orig, params.arguments) }); }
-      catch (e) { toClient({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: `Error (backend ${r.b.name}): ${e.message}` }], isError: true } }); }
+      if (!r) { audit({ event: 'call', tool: params.name, ok: false, error: 'unknown_tool' }); toClient({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: `Error: unknown tool "${params.name}" (backend down or restarting?)` }], isError: true } }); return; }
+      const t0 = Date.now(); const arg_keys = redactArgs(params.arguments);
+      try {
+        const res = await r.b.callTool(r.orig, params.arguments);
+        audit({ event: 'call', backend: r.b.name, tool: r.orig, arg_keys, ok: !res?.isError, ms: Date.now() - t0, result_bytes: JSON.stringify(res).length });
+        toClient({ jsonrpc: '2.0', id, result: res });
+      } catch (e) {
+        audit({ event: 'call', backend: r.b.name, tool: r.orig, arg_keys, ok: false, ms: Date.now() - t0, error: e.message });
+        toClient({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: `Error (backend ${r.b.name}): ${e.message}` }], isError: true } });
+      }
       return;
     }
     default: if (!isNotif) toClient({ jsonrpc: '2.0', id, error: { code: -32601, message: `method not found: ${method}` } });

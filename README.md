@@ -15,7 +15,10 @@ backends as supervised children — the fleet self-heals without the human in th
   (`momento.search`, `serval.navigate`), routed to the owning child.
 - **Self-heal** — a crashed backend is respawned (300 ms backoff), re-initialized, and its tools
   refreshed; marshal emits `notifications/tools/list_changed` so the client updates.
-- **Zero deps** — ~150 lines of Node, hand-rolled MCP stdio (no SDK).
+- **Audit trail** — every tool call is logged append-only + **hash-chained** (tamper-evident) to
+  `~/.marshal/audit.jsonl` (`$MARSHAL_AUDIT`). **Redacted**: arg *keys + type/length*, never raw values
+  (a log of values would itself be an exfil surface). Row: `{ts,backend,tool,arg_keys,ok,ms,result_bytes,prev}`.
+- **Zero deps** — ~180 lines of Node, hand-rolled MCP stdio (no SDK).
 
 ## Use
 ```bash
