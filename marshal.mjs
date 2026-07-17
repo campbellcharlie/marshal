@@ -15,7 +15,7 @@
  * Zero deps. Config: marshal.config.json ($MARSHAL_CONFIG) = { "backends": [{name,command,args}] }.
  */
 import { spawn } from 'node:child_process';
-import { readFileSync, appendFileSync, mkdirSync, rmSync } from 'node:fs';
+import { readFileSync, appendFileSync, mkdirSync, rmSync, statSync, renameSync, readdirSync, unlinkSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
@@ -30,14 +30,27 @@ const err = (m) => process.stderr.write(`[marshal] ${m}\n`);
 
 // ── audit trail (primary only) ──────────────────────────────────────────────────────────────────
 const AUDIT = process.env.MARSHAL_AUDIT || join(homedir(), '.marshal', 'audit.jsonl');
+const AUDIT_MAX = Number(process.env.MARSHAL_AUDIT_MAX || 5_000_000);   // rotate the active log at ~5 MB
+const AUDIT_KEEP = Number(process.env.MARSHAL_AUDIT_KEEP || 10);        // retain this many rotated segments
 let lastHash = '0'.repeat(64);
 try { const ls = readFileSync(AUDIT, 'utf8').trim().split('\n').filter(Boolean); if (ls.length) lastHash = createHash('sha256').update(ls[ls.length - 1]).digest('hex'); } catch {}
 const redactArgs = (a) => (a && typeof a === 'object')
   ? Object.entries(a).map(([k, v]) => `${k}:${Array.isArray(v) ? `array[${v.length}]` : typeof v === 'string' ? `str[${v.length}]` : typeof v}`)
   : [];
+// Rotate the active log to a timestamped segment. lastHash is UNCHANGED, so the next file's first row
+// anchors to this segment's tip — the hash chain continues unbroken across rotations (verify by
+// concatenating segments in order). Prune the oldest beyond AUDIT_KEEP.
+function rotateAudit() {
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  renameSync(AUDIT, `${AUDIT}.${ts}`);
+  const base = dirname(AUDIT), name = AUDIT.split('/').pop();
+  const segs = readdirSync(base).filter((f) => f.startsWith(name + '.') && /\.\d{4}-\d{2}-\d{2}T/.test(f)).sort();
+  for (const old of segs.slice(0, -AUDIT_KEEP)) { try { unlinkSync(join(base, old)); } catch {} }
+}
 function audit(entry) {
   try {
     mkdirSync(dirname(AUDIT), { recursive: true });
+    try { if (statSync(AUDIT).size >= AUDIT_MAX) rotateAudit(); } catch {}
     const line = JSON.stringify({ ts: new Date().toISOString(), ...entry, prev: lastHash });
     appendFileSync(AUDIT, line + '\n');
     lastHash = createHash('sha256').update(line).digest('hex');
