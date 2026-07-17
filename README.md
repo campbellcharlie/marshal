@@ -18,6 +18,10 @@ backends as supervised children — the fleet self-heals without the human in th
 - **Audit trail** — every tool call is logged append-only + **hash-chained** (tamper-evident) to
   `~/.marshal/audit.jsonl` (`$MARSHAL_AUDIT`). **Redacted**: arg *keys + type/length*, never raw values
   (a log of values would itself be an exfil surface). Row: `{ts,backend,tool,arg_keys,ok,ms,result_bytes,prev}`.
+- **Singleton** — Claude Code pre-warms spare sessions, so it may launch marshal more than once. The
+  first becomes the **primary** (owns backends + audit, listens on `~/.marshal/marshal.sock`); any later
+  one becomes a thin **proxy** (pipes stdio ⇄ the primary, spawns nothing). One backend fleet, one audit
+  writer — no `:52849`/DB contention or interleaved-log corruption. Verified by `singleton-probe.mjs`.
 - **Zero deps** — ~180 lines of Node, hand-rolled MCP stdio (no SDK).
 
 ## Use

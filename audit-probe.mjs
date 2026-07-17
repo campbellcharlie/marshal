@@ -21,7 +21,7 @@ const cfgFile = join(dir, 'cfg.json');
 writeFileSync(cfgFile, JSON.stringify({ backends: [momento] }));
 const SENTINEL = 'REDACT_SENTINEL_XYZ';
 
-const m = spawn('node', [join(HERE, 'marshal.mjs')], { stdio: ['pipe', 'pipe', 'inherit'], env: { ...process.env, MARSHAL_AUDIT: auditFile, MARSHAL_CONFIG: cfgFile } });
+const m = spawn('node', [join(HERE, 'marshal.mjs')], { stdio: ['pipe', 'pipe', 'inherit'], env: { ...process.env, MARSHAL_AUDIT: auditFile, MARSHAL_SOCK: join(dir, 'm.sock'), MARSHAL_CONFIG: cfgFile } });
 const pending = new Map(); let nextId = 1; let buf = '';
 m.stdout.setEncoding('utf8');
 m.stdout.on('data', (d) => { buf += d; let i; while ((i = buf.indexOf('\n')) >= 0) { const l = buf.slice(0, i); buf = buf.slice(i + 1); if (!l.trim()) continue; let x; try { x = JSON.parse(l); } catch { continue; } if (x.id != null && pending.has(x.id)) { pending.get(x.id)(x); pending.delete(x.id); } } });

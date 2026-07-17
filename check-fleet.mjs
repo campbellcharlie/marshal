@@ -3,7 +3,7 @@
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url'; import { dirname, join } from 'node:path';
 const HERE = dirname(fileURLToPath(import.meta.url));
-const m = spawn('node', [join(HERE, 'marshal.mjs')], { stdio: ['pipe', 'pipe', 'inherit'] });
+const m = spawn('node', [join(HERE, 'marshal.mjs')], { stdio: ['pipe','pipe','inherit'], env: { ...process.env, MARSHAL_SOCK: `/tmp/marshal-${process.pid}.sock`, MARSHAL_AUDIT: `/tmp/marshal-${process.pid}.jsonl` } });
 const pending = new Map(); let nextId = 1; let buf = '';
 m.stdout.setEncoding('utf8');
 m.stdout.on('data', (d) => { buf += d; let i; while ((i = buf.indexOf('\n')) >= 0) { const l = buf.slice(0, i); buf = buf.slice(i + 1); if (!l.trim()) continue; let x; try { x = JSON.parse(l); } catch { continue; } if (x.id != null && pending.has(x.id)) { pending.get(x.id)(x); pending.delete(x.id); } } });

@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const m = spawn('node', [join(HERE, 'marshal.mjs')], { stdio: ['pipe', 'pipe', 'inherit'] });
+const m = spawn('node', [join(HERE, 'marshal.mjs')], { stdio: ['pipe','pipe','inherit'], env: { ...process.env, MARSHAL_SOCK: `/tmp/marshal-${process.pid}.sock`, MARSHAL_AUDIT: `/tmp/marshal-${process.pid}.jsonl` } });
 const pending = new Map(); let nextId = 1; let buf = '';
 m.stdout.setEncoding('utf8');
 m.stdout.on('data', (d) => {
