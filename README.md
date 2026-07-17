@@ -36,10 +36,16 @@ That's the whole product: the aggregation you'd get from any gateway, plus the t
 ## How it works
 
 - **One endpoint, many servers.** Every backend's tools are exposed under a `backend.tool` namespace
-  (`momento.search`, `serval.navigate`), routed to the owning child.
+  (`momento.search`, `serval.navigate`), routed to the owning child. **Resources and prompts** are
+  aggregated too (capability-gated per backend): resources route by their original uri, prompts are
+  namespaced like tools.
+- **Legible sub-tools.** The client labels every call by *server* — so a fleet behind one server would all
+  read as "marshal". Each proxied tool/prompt carries a spec `title` (`momento · search`) and a
+  `[backend]`-prefixed description; the `marshal.recent` tool reports which backend tool actually ran.
 - **Self-heal.** A crashed backend is respawned (300 ms backoff), re-initialized, and its tools refreshed;
   marshal emits `notifications/tools/list_changed` so the client updates. The client connection is never
-  interrupted.
+  interrupted. A backend that *hangs* (never answers) rather than exits is caught by a per-call timeout
+  (`MARSHAL_CALL_TIMEOUT`, default 120 s) so the client is never stalled forever.
 - **Singleton.** Claude pre-warms spare sessions, so it may launch marshal more than once. The first becomes
   the **primary** (owns backends + audit, listens on `~/.marshal/marshal.sock`); any later one becomes a
   thin **proxy** that pipes its stdio ⇄ the primary and spawns nothing. One fleet, one audit writer —
@@ -58,6 +64,9 @@ Marshal's **mechanisms are verified** by falsifiable probes you can run (`node <
 | `audit-probe.mjs` | **audit** — rows written, args **redacted**, hash chain valid |
 | `rotation-probe.mjs` | **rotation** — log rotates + prunes; chain unbroken across segments |
 | `hot-add-probe.mjs` | **hot-add** — edit config → backend appears/leaves with no restart |
+| `introspect-probe.mjs` | **observability** — tools carry `title` + `[backend]` desc; `marshal.recent` reports the real sub-tool |
+| `timeout-probe.mjs` | **timeout** — a hung backend times out with an error, not an infinite stall |
+| `resources-probe.mjs` | **resources/prompts** — backend resources + prompts are aggregated and routed |
 
 What is **not** benchmarked: any comparative claim (faster / lighter / better than gateway *X*). Marshal is
 right-sized for a single machine + stdio MCP; if you need HTTP transport, auth, multi-tenant, or
@@ -91,8 +100,10 @@ Knobs (env): `MARSHAL_AUDIT_MAX` (5 MB) · `MARSHAL_AUDIT_KEEP` (10) · `MARSHAL
 
 | Feature | What it does | Verified |
 |---|---|---|
-| **Aggregate** | many stdio MCP servers behind one endpoint, tools namespaced | ✅ |
+| **Aggregate** | many stdio MCP servers behind one endpoint — tools, resources & prompts namespaced | ✅ |
+| **Legible sub-tools** | `title` + `[backend]` desc on each tool; `marshal.recent` shows the real sub-tool | ✅ |
 | **Self-heal** | crashed backend respawned transparently; client never disconnects | ✅ |
+| **Call timeout** | a hung (non-exiting) backend call times out instead of stalling the client | ✅ |
 | **Singleton** | N marshal instances → 1 backend fleet (primary + thin proxies) | ✅ |
 | **Audit trail** | hash-chained, redacted, one JSONL row per tool call | ✅ |
 | **Rotation** | size-based rotation + retention; chain spans segments | ✅ |
@@ -114,7 +125,7 @@ Every tool call flows through marshal's one chokepoint, so it logs one append-on
 <details>
 <summary><strong>Known limitations (v0.1)</strong></summary>
 
-- **No per-request timeout** — respawn triggers on backend *exit*, not a *hang*; a hung backend hangs that one call.
+- **Timeout is per-call, not a hang-triggered restart** — a hung call times out (`MARSHAL_CALL_TIMEOUT`), but marshal does not yet kill+respawn a *persistently* unresponsive backend; only *exit* triggers respawn.
 - **stdio transport only** — no HTTP/SSE, auth, or multi-tenant (by design; use a full gateway if you need them).
 - **Primary death → brief gap** — proxies exit on primary loss; Claude re-spawns and one promotes (seconds).
 - **`fs.watch` is best-effort** — hot-add is a convenience, not a guarantee on every filesystem.
@@ -131,6 +142,10 @@ singleton-probe.mjs         # primary/proxy singleton probe
 audit-probe.mjs             # audit chain + redaction probe
 rotation-probe.mjs          # rotation + retention probe
 hot-add-probe.mjs           # live config-reconcile probe
+introspect-probe.mjs        # title/description + marshal.recent observability probe
+timeout-probe.mjs           # per-call hang-timeout probe
+resources-probe.mjs         # resources + prompts aggregation probe
+fake-backend.mjs            # minimal MCP backend fixture used by the probes above
 serval-probe.mjs            # isolated serval backend check
 check-fleet.mjs             # aggregate sanity (all backends namespaced)
 ```
