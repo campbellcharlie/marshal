@@ -1,0 +1,6 @@
+# machine-specific backend paths — copy from marshal.config.example.json
+marshal.config.json
+
+node_modules/
+.DS_Store
+**/.DS_Store

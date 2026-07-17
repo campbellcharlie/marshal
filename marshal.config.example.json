@@ -1,0 +1,6 @@
+{
+  "backends": [
+    { "name": "momento", "command": "node", "args": ["/ABSOLUTE/PATH/TO/momento/dist/server.js"] },
+    { "name": "serval", "command": "/ABSOLUTE/PATH/TO/Serval.app/Contents/MacOS/Serval", "args": ["--mcp"] }
+  ]
+}
