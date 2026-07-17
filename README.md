@@ -31,7 +31,7 @@ transparently — the client connection never drops. And no matter how many sess
 > **The client should never see a backend die.**
 
 That's the whole product: the aggregation you'd get from any gateway, plus the two things most gateways
-*don't* do — **self-heal** and a **tamper-evident audit trail** — in ~200 lines of zero-dependency Node.
+*don't* do — **self-heal** and a **tamper-evident audit trail** — in ~270 lines of zero-dependency Node.
 
 ## How it works
 
@@ -94,7 +94,7 @@ claude mcp add -s user marshal /opt/homebrew/bin/node -- ~/src/marshal/marshal.m
 { "backends": [ { "name": "momento", "command": "node", "args": [".../momento/dist/server.js"] } ] }
 ```
 
-Knobs (env): `MARSHAL_AUDIT_MAX` (5 MB) · `MARSHAL_AUDIT_KEEP` (10) · `MARSHAL_AUDIT` · `MARSHAL_SOCK` · `MARSHAL_CONFIG`.
+Knobs (env): `MARSHAL_CALL_TIMEOUT` (120 s) · `MARSHAL_AUDIT_MAX` (5 MB) · `MARSHAL_AUDIT_KEEP` (10) · `MARSHAL_AUDIT` · `MARSHAL_SOCK` · `MARSHAL_CONFIG`.
 
 ## Features
 
@@ -111,8 +111,9 @@ Knobs (env): `MARSHAL_AUDIT_MAX` (5 MB) · `MARSHAL_AUDIT_KEEP` (10) · `MARSHAL
 
 ## Audit trail
 
-Every tool call flows through marshal's one chokepoint, so it logs one append-only JSONL row per call to
-`~/.marshal/audit.jsonl` (`$MARSHAL_AUDIT`):
+Every call flows through marshal's one chokepoint, so it logs one append-only JSONL row per event to
+`~/.marshal/audit.jsonl` (`$MARSHAL_AUDIT`) — `call` (tool), `read` (resource), `prompt` (prompt get),
+plus backend lifecycle (`backend_ready`/`_exit`/`_add`/`_remove`):
 
 ```json
 {"ts":"…","event":"call","backend":"serval","tool":"navigate","arg_keys":["url:str[42]"],"ok":true,"ms":412,"result_bytes":1840,"prev":"7c9c34…"}
@@ -135,7 +136,7 @@ Every tool call flows through marshal's one chokepoint, so it logs one append-on
 ## Layout
 
 ```
-marshal.mjs                 # the aggregator + supervisor (zero deps, ~200 lines)
+marshal.mjs                 # the aggregator + supervisor (zero deps, ~270 lines)
 marshal.config.example.json # copy → marshal.config.json (gitignored)
 probe.mjs                   # self-heal probe
 singleton-probe.mjs         # primary/proxy singleton probe
