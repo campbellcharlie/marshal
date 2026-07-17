@@ -16,11 +16,13 @@
  */
 import { spawn } from 'node:child_process';
 import { readFileSync, appendFileSync, mkdirSync, rmSync, statSync, renameSync, readdirSync, unlinkSync, watch } from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, URL } from 'node:url';
 import { dirname, join, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { createServer, connect } from 'node:net';
+import http from 'node:http';
+import https from 'node:https';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CONFIG = process.env.MARSHAL_CONFIG || join(HERE, 'marshal.config.json');
@@ -69,33 +71,124 @@ function notifyToolsChanged() {
   if (backends.some((b) => b.prompts.length)) broadcast({ jsonrpc: '2.0', method: 'notifications/prompts/list_changed' });
 }
 
-// ── a supervised backend MCP child ──────────────────────────────────────────────────────────────
+// ── a supervised backend MCP server (a spawned stdio child, or a remote HTTP/SSE MCP server) ──────
+// Config: stdio = {name, command, args}; remote = {name, url, headers?, transport?}. `transport` is
+// 'http' (Streamable HTTP), 'sse' (classic SSE), or 'auto' (try HTTP, fall back to SSE). The JSON-RPC
+// dispatch, timeout, aggregation, routing, audit and self-heal are all transport-agnostic — only how a
+// message is sent and how death is detected differs per transport.
 class Backend {
-  constructor(cfg) { this.name = cfg.name; this.command = cfg.command; this.args = cfg.args || []; this.tools = []; this.resources = []; this.resourceTemplates = []; this.prompts = []; this.caps = {}; this.pending = new Map(); this.nextId = 1; this.buf = ''; this.ready = false; this.start(); }
+  constructor(cfg) {
+    this.name = cfg.name; this.command = cfg.command; this.args = cfg.args || [];
+    this.url = cfg.url || null; this.headers = cfg.headers || {};
+    this.transport = cfg.transport || (this.url ? 'auto' : 'stdio');
+    this.tools = []; this.resources = []; this.resourceTemplates = []; this.prompts = []; this.caps = {};
+    this.pending = new Map(); this.nextId = 1; this.buf = ''; this.sbuf = ''; this.ready = false; this.retries = 0;
+    this.start();
+  }
   start() {
-    this.ready = false;
-    this.proc = spawn(this.command, this.args, { stdio: ['pipe', 'pipe', 'inherit'] });
+    this.reconnecting = false; this.ready = false;
+    if (this.url) return this.startRemote();
+    this.proc = spawn(this.command, this.args, { stdio: ['pipe', 'pipe', 'inherit'] });   // stdio: supervised child
     this.proc.stdout.setEncoding('utf8');
     this.proc.stdout.on('data', (d) => this.onData(d));
     this.proc.on('error', (e) => err(`backend ${this.name} spawn error: ${e.message}`));
-    this.proc.on('exit', (code) => {
-      this.ready = false; this.tools = []; this.resources = []; this.resourceTemplates = []; this.prompts = [];
-      this.pending.forEach((p) => p.reject(new Error(`backend ${this.name} restarted`))); this.pending.clear();
-      notifyToolsChanged(); audit({ event: 'backend_exit', backend: this.name, code });
-      if (this.stopping) { err(`backend ${this.name} removed (hot-remove)`); return; }
-      err(`backend ${this.name} exited (code ${code}) — respawning in 300ms`);
-      setTimeout(() => this.start(), 300);
-    });
-    this.init();
+    this.proc.on('exit', (code) => this.onClose(`exited (code ${code})`));
+    this.init().catch((e) => err(`backend ${this.name} init failed: ${e.message}`));
   }
+  // Remote transports. HTTP has no long-lived socket (init/req are POSTs); SSE holds a GET stream open
+  // and POSTs requests to the endpoint the server advertises.
+  startRemote() {
+    this.sessionId = null; this.postUrl = null; this.sbuf = '';
+    if (this.transport === 'sse') { this.transportKind = 'sse'; return this.startSSE(); }
+    this.transportKind = 'http';                                                        // 'http' or 'auto' → try Streamable HTTP first
+    this.init().then(() => {}, (e) => {
+      if (this.transport === 'auto') { err(`backend ${this.name} HTTP init failed (${e.message}); trying SSE`); this.transportKind = 'sse'; this.startSSE(); }
+      else this.onClose(`init failed: ${e.message}`);
+    });
+  }
+  startSSE() {
+    const u = new URL(this.url); const mod = u.protocol === 'https:' ? https : http;
+    const req = mod.request(u, { method: 'GET', headers: { Accept: 'text/event-stream', ...this.headers } }, (res) => {
+      if (res.statusCode !== 200) { res.resume(); return this.onClose(`SSE GET ${res.statusCode}`); }
+      res.setEncoding('utf8'); this.sseRes = res;
+      res.on('data', (d) => this.feedSSE(d));
+      res.on('end', () => this.onClose('SSE stream ended'));
+      res.on('error', (e) => this.onClose(`SSE stream error: ${e.message}`));
+    });
+    req.on('error', (e) => this.onClose(`SSE connect error: ${e.message}`));
+    req.end(); this.sseReq = req;
+  }
+  // Parse SSE frames (event:/data:) from a stream. The classic-SSE GET stream first emits an `endpoint`
+  // frame naming the POST URL (which triggers init); every other frame carries a JSON-RPC message.
+  feedSSE(chunk) {
+    this.sbuf += chunk; let idx;
+    while ((idx = this.sbuf.indexOf('\n\n')) >= 0) {
+      const frame = this.sbuf.slice(0, idx); this.sbuf = this.sbuf.slice(idx + 2);
+      let event = 'message', data = '';
+      for (const l of frame.split('\n')) { if (l.startsWith('event:')) event = l.slice(6).trim(); else if (l.startsWith('data:')) data += l.slice(5).trim(); }
+      if (event === 'endpoint') { this.postUrl = new URL(data, this.url).href; if (!this.initStarted) { this.initStarted = true; this.init().catch((e) => this.onClose(`init failed: ${e.message}`)); } }
+      else if (data) { try { this.dispatch(JSON.parse(data)); } catch {} }
+    }
+  }
+  // POST a JSON-RPC message. For Streamable HTTP the reply is in the POST body (JSON or an SSE stream) →
+  // dispatch it; for classic SSE the POST is just accepted (202) and the reply arrives on the GET stream.
+  httpPost(url, body, readReply) {
+    return new Promise((resolve, reject) => {
+      const u = new URL(url); const mod = u.protocol === 'https:' ? https : http;
+      const headers = { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', ...this.headers };
+      if (this.sessionId) headers['Mcp-Session-Id'] = this.sessionId;
+      const req = mod.request(u, { method: 'POST', headers }, (res) => {
+        const sid = res.headers['mcp-session-id']; if (sid) this.sessionId = sid;
+        const ct = res.headers['content-type'] || '';
+        res.setEncoding('utf8');
+        if (readReply && ct.includes('text/event-stream')) { res.on('data', (d) => this.feedSSE(d)); res.on('end', resolve); res.on('error', reject); return; }
+        let data = ''; res.on('data', (d) => data += d);
+        res.on('end', () => {
+          if (!readReply) return resolve();
+          if (res.statusCode >= 400) return reject(new Error(`HTTP ${res.statusCode}`));
+          if (data.trim()) { try { this.dispatch(JSON.parse(data)); return resolve(); } catch {} }
+          reject(new Error(`no JSON-RPC reply (status ${res.statusCode}, type ${ct || 'none'})`));   // not Streamable HTTP → lets 'auto' fall back to SSE fast
+        });
+        res.on('error', reject);
+      });
+      req.on('error', reject); req.write(body); req.end();
+    });
+  }
+  // Transport-agnostic send. Returns a promise (remote) or undefined (stdio); req() awaits it either way.
+  send(obj) {
+    const line = JSON.stringify(obj);
+    if (!this.url) return this.proc.stdin.write(line + '\n');
+    if (this.transportKind === 'sse') return this.httpPost(this.postUrl, line, false);
+    return this.httpPost(this.url, line, true);
+  }
+  notify(method, params) { try { const r = this.send({ jsonrpc: '2.0', method, params }); if (r && r.catch) r.catch(() => {}); } catch {} }
   onData(d) {
     this.buf += d; let i;
     while ((i = this.buf.indexOf('\n')) >= 0) {
       const line = this.buf.slice(0, i); this.buf = this.buf.slice(i + 1); if (!line.trim()) continue;
       let m; try { m = JSON.parse(line); } catch { continue; }
-      if (m.id != null && this.pending.has(m.id)) { const p = this.pending.get(m.id); this.pending.delete(m.id); m.error ? p.reject(new Error(m.error.message || 'backend error')) : p.resolve(m.result); }
+      this.dispatch(m);
     }
   }
+  // Match a JSON-RPC response to its pending request (shared by every transport).
+  dispatch(m) {
+    if (m.id != null && this.pending.has(m.id)) { const p = this.pending.get(m.id); this.pending.delete(m.id); m.error ? p.reject(new Error(m.error.message || 'backend error')) : p.resolve(m.result); }
+  }
+  // A transport died (process exit or connection drop). Reject in-flight calls and reconnect with capped
+  // exponential backoff (300ms → 30s) so a permanently-down backend doesn't hammer-retry — which matters
+  // most for a remote URL that can't be respawned, only re-connected. `retries` resets to 0 on ready.
+  onClose(reason) {
+    if (this.reconnecting) return;
+    this.reconnecting = true; this.ready = false; this.initStarted = false;
+    this.tools = []; this.resources = []; this.resourceTemplates = []; this.prompts = [];
+    this.pending.forEach((p) => p.reject(new Error(`backend ${this.name} restarted`))); this.pending.clear();
+    notifyToolsChanged(); audit({ event: 'backend_exit', backend: this.name, reason });
+    if (this.stopping) { err(`backend ${this.name} removed (hot-remove)`); return; }
+    const delay = Math.min(300 * 2 ** this.retries, 30_000); this.retries++;
+    err(`backend ${this.name} ${reason} — reconnecting in ${delay}ms`);
+    setTimeout(() => this.start(), delay);
+  }
+  stop() { this.stopping = true; try { this.proc?.kill(); this.sseReq?.destroy(); this.sseRes?.destroy(); } catch {} }
   req(method, params) {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
@@ -103,35 +196,36 @@ class Backend {
       // so without this timer the pending promise (and the client's call) waits forever. Reject on timeout.
       const timer = setTimeout(() => { if (this.pending.delete(id)) reject(new Error(`backend ${this.name} timed out after ${CALL_TIMEOUT}ms (${method})`)); }, CALL_TIMEOUT);
       this.pending.set(id, { resolve: (v) => { clearTimeout(timer); resolve(v); }, reject: (e) => { clearTimeout(timer); reject(e); } });
-      try { this.proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n'); } catch (e) { clearTimeout(timer); this.pending.delete(id); reject(e); }
+      // send() is sync for stdio, a POST promise for remote — a transport-level failure rejects this call.
+      Promise.resolve().then(() => this.send({ jsonrpc: '2.0', id, method, params })).catch((e) => { clearTimeout(timer); if (this.pending.delete(id)) reject(e); });
     });
   }
+  // Throws on core-handshake failure; the caller (start / startRemote / feedSSE) decides whether to log
+  // (stdio), fall back to another transport (auto), or reconnect (remote).
   async init() {
-    try {
-      const initRes = await this.req('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'marshal', version: '0.1.0' } });
-      this.caps = initRes?.capabilities || {};
-      this.proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
-      const r = await this.req('tools/list', {});
-      this.tools = (r.tools || []).map((t) => ({
-        ...t,
-        name: `${this.name}.${t.name}`,
-        title: t.title || `${this.name} · ${t.name}`,                                 // spec `title` = human-facing display name, so the sub-tool (not just "marshal") is legible
-        description: t.description ? `[${this.name}] ${t.description}` : `[${this.name}] ${t.name}`,
-        _orig: t.name,
-      }));
-      // Aggregate resources & prompts too — only if the backend advertises the capability (else the
-      // request would be an error). Resources route by their (opaque, assumed-unique) uri; prompts are
-      // namespaced like tools. A backend without these caps simply contributes nothing.
-      if (this.caps.resources) {
-        try { this.resources = ((await this.req('resources/list', {})).resources || []).map((x) => ({ ...x, _backend: this.name })); } catch (e) { err(`backend ${this.name} resources/list failed: ${e.message}`); }
-        try { this.resourceTemplates = ((await this.req('resources/templates/list', {})).resourceTemplates || []).map((x) => ({ ...x, _backend: this.name })); } catch {}
-      }
-      if (this.caps.prompts) {
-        try { this.prompts = ((await this.req('prompts/list', {})).prompts || []).map((p) => ({ ...p, name: `${this.name}.${p.name}`, title: p.title || `${this.name} · ${p.name}`, _orig: p.name })); } catch (e) { err(`backend ${this.name} prompts/list failed: ${e.message}`); }
-      }
-      this.ready = true; audit({ event: 'backend_ready', backend: this.name, tools: this.tools.length, resources: this.resources.length, prompts: this.prompts.length });
-      err(`backend ${this.name} ready: ${this.tools.length} tools, ${this.resources.length} resources, ${this.prompts.length} prompts`); notifyToolsChanged();
-    } catch (e) { err(`backend ${this.name} init failed: ${e.message}`); }
+    const initRes = await this.req('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'marshal', version: '0.1.0' } });
+    this.caps = initRes?.capabilities || {};
+    this.notify('notifications/initialized');
+    const r = await this.req('tools/list', {});
+    this.tools = (r.tools || []).map((t) => ({
+      ...t,
+      name: `${this.name}.${t.name}`,
+      title: t.title || `${this.name} · ${t.name}`,                                 // spec `title` = human-facing display name, so the sub-tool (not just "marshal") is legible
+      description: t.description ? `[${this.name}] ${t.description}` : `[${this.name}] ${t.name}`,
+      _orig: t.name,
+    }));
+    // Aggregate resources & prompts too — only if the backend advertises the capability (else the
+    // request would be an error). Resources route by their (opaque, assumed-unique) uri; prompts are
+    // namespaced like tools. A backend without these caps simply contributes nothing.
+    if (this.caps.resources) {
+      try { this.resources = ((await this.req('resources/list', {})).resources || []).map((x) => ({ ...x, _backend: this.name })); } catch (e) { err(`backend ${this.name} resources/list failed: ${e.message}`); }
+      try { this.resourceTemplates = ((await this.req('resources/templates/list', {})).resourceTemplates || []).map((x) => ({ ...x, _backend: this.name })); } catch {}
+    }
+    if (this.caps.prompts) {
+      try { this.prompts = ((await this.req('prompts/list', {})).prompts || []).map((p) => ({ ...p, name: `${this.name}.${p.name}`, title: p.title || `${this.name} · ${p.name}`, _orig: p.name })); } catch (e) { err(`backend ${this.name} prompts/list failed: ${e.message}`); }
+    }
+    this.ready = true; this.retries = 0; audit({ event: 'backend_ready', backend: this.name, transport: this.transportKind || 'stdio', tools: this.tools.length, resources: this.resources.length, prompts: this.prompts.length });
+    err(`backend ${this.name} ready (${this.transportKind || 'stdio'}): ${this.tools.length} tools, ${this.resources.length} resources, ${this.prompts.length} prompts`); notifyToolsChanged();
   }
   callTool(orig, args) { return this.req('tools/call', { name: orig, arguments: args || {} }); }
 }
@@ -175,7 +269,7 @@ function reconcile() {
   let want; try { want = JSON.parse(readFileSync(CONFIG, 'utf8')).backends || []; } catch (e) { err(`reconcile: bad config, ignored: ${e.message}`); return; }
   const names = new Set(want.map((b) => b.name));
   for (const c of want) if (!backends.some((b) => b.name === c.name)) { backends.push(new Backend(c)); audit({ event: 'backend_add', backend: c.name }); err(`hot-add backend: ${c.name}`); }
-  for (const b of backends) if (!names.has(b.name)) { b.stopping = true; try { b.proc.kill(); } catch {} audit({ event: 'backend_remove', backend: b.name }); }
+  for (const b of backends) if (!names.has(b.name)) { b.stop(); audit({ event: 'backend_remove', backend: b.name }); }
   backends = backends.filter((b) => names.has(b.name));
   notifyToolsChanged();
 }
@@ -250,7 +344,7 @@ function runPrimary() {
     let wt; try { watch(dirname(CONFIG), (_e, fn) => { if (!fn || fn === basename(CONFIG)) { clearTimeout(wt); wt = setTimeout(reconcile, 300); } }); } catch (e) { err(`config watch unavailable: ${e.message}`); }
     err(`PRIMARY up — supervising ${backendsCfg.map((b) => b.name).join(', ') || '(none)'} on ${SOCK} (watching config for hot-add/remove)`);
   });
-  const shutdown = () => { for (const b of backends) { try { b.proc.kill(); } catch {} } try { rmSync(SOCK); } catch {} process.exit(0); };
+  const shutdown = () => { for (const b of backends) b.stop(); try { rmSync(SOCK); } catch {} process.exit(0); };
   process.on('SIGINT', shutdown); process.on('SIGTERM', shutdown);
 }
 function runProxy(sock) {                                  // thin forwarder to the primary

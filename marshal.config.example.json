@@ -1,6 +1,7 @@
 {
   "backends": [
     { "name": "momento", "command": "node", "args": ["/ABSOLUTE/PATH/TO/momento/dist/server.js"] },
-    { "name": "serval", "command": "/ABSOLUTE/PATH/TO/Serval.app/Contents/MacOS/Serval", "args": ["--mcp"] }
+    { "name": "serval", "command": "/ABSOLUTE/PATH/TO/Serval.app/Contents/MacOS/Serval", "args": ["--mcp"] },
+    { "name": "remote", "url": "https://example.com/mcp", "headers": { "Authorization": "Bearer TOKEN" }, "transport": "auto" }
   ]
 }

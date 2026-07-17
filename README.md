@@ -31,7 +31,7 @@ transparently — the client connection never drops. And no matter how many sess
 > **The client should never see a backend die.**
 
 That's the whole product: the aggregation you'd get from any gateway, plus the two things most gateways
-*don't* do — **self-heal** and a **tamper-evident audit trail** — in ~270 lines of zero-dependency Node.
+*don't* do — **self-heal** and a **tamper-evident audit trail** — in ~360 lines of zero-dependency Node.
 
 ## How it works
 
@@ -39,12 +39,17 @@ That's the whole product: the aggregation you'd get from any gateway, plus the t
   (`momento.search`, `serval.navigate`), routed to the owning child. **Resources and prompts** are
   aggregated too (capability-gated per backend): resources route by their original uri, prompts are
   namespaced like tools.
+- **stdio *and* remote backends.** A backend is either a spawned stdio child (`{name, command, args}`) or a
+  **remote MCP server** (`{name, url, headers?, transport?}`) — marshal speaks **Streamable HTTP** and
+  classic **SSE**; `transport: "auto"` (default) tries HTTP first and falls back to SSE. All the aggregation,
+  routing, audit and self-heal are transport-agnostic. Zero deps — remote transport is built on `node:http/https`.
 - **Legible sub-tools.** The client labels every call by *server* — so a fleet behind one server would all
   read as "marshal". Each proxied tool/prompt carries a spec `title` (`momento · search`) and a
   `[backend]`-prefixed description; the `marshal.recent` tool reports which backend tool actually ran.
-- **Self-heal.** A crashed backend is respawned (300 ms backoff), re-initialized, and its tools refreshed;
-  marshal emits `notifications/tools/list_changed` so the client updates. The client connection is never
-  interrupted. A backend that *hangs* (never answers) rather than exits is caught by a per-call timeout
+- **Self-heal.** A dead backend (crashed child *or* dropped remote connection) is reconnected with capped
+  exponential backoff (300 ms → 30 s), re-initialized, and its tools refreshed; marshal emits
+  `notifications/tools/list_changed` so the client updates. The client connection is never interrupted. A
+  backend that *hangs* (never answers) rather than dies is caught by a per-call timeout
   (`MARSHAL_CALL_TIMEOUT`, default 120 s) so the client is never stalled forever.
 - **Singleton.** Claude pre-warms spare sessions, so it may launch marshal more than once. The first becomes
   the **primary** (owns backends + audit, listens on `~/.marshal/marshal.sock`); any later one becomes a
@@ -67,6 +72,7 @@ Marshal's **mechanisms are verified** by falsifiable probes you can run (`node <
 | `introspect-probe.mjs` | **observability** — tools carry `title` + `[backend]` desc; `marshal.recent` reports the real sub-tool |
 | `timeout-probe.mjs` | **timeout** — a hung backend times out with an error, not an infinite stall |
 | `resources-probe.mjs` | **resources/prompts** — backend resources + prompts are aggregated and routed |
+| `remote-probe.mjs` | **remote transports** — HTTP + SSE MCP backends connect, aggregate, route, auto-detect, reconnect |
 
 What is **not** benchmarked: any comparative claim (faster / lighter / better than gateway *X*). Marshal is
 right-sized for a single machine + stdio MCP; if you need HTTP transport, auth, multi-tenant, or
@@ -88,10 +94,13 @@ claude mcp add -s user marshal /opt/homebrew/bin/node -- ~/src/marshal/marshal.m
 # restart Claude Code
 ```
 
-`marshal.config.json` (gitignored — machine-specific):
+`marshal.config.json` (gitignored — machine-specific). A backend is a stdio child *or* a remote URL:
 
 ```json
-{ "backends": [ { "name": "momento", "command": "node", "args": [".../momento/dist/server.js"] } ] }
+{ "backends": [
+  { "name": "momento", "command": "node", "args": [".../momento/dist/server.js"] },
+  { "name": "remote", "url": "https://example.com/mcp", "headers": { "Authorization": "Bearer TOKEN" }, "transport": "auto" }
+] }
 ```
 
 Knobs (env): `MARSHAL_CALL_TIMEOUT` (120 s) · `MARSHAL_AUDIT_MAX` (5 MB) · `MARSHAL_AUDIT_KEEP` (10) · `MARSHAL_AUDIT` · `MARSHAL_SOCK` · `MARSHAL_CONFIG`.
@@ -100,9 +109,10 @@ Knobs (env): `MARSHAL_CALL_TIMEOUT` (120 s) · `MARSHAL_AUDIT_MAX` (5 MB) · `MA
 
 | Feature | What it does | Verified |
 |---|---|---|
-| **Aggregate** | many stdio MCP servers behind one endpoint — tools, resources & prompts namespaced | ✅ |
+| **Aggregate** | many MCP servers behind one endpoint — tools, resources & prompts namespaced | ✅ |
+| **stdio + remote** | backends are stdio children **or** remote MCP servers (Streamable HTTP / SSE, auto-detected) | ✅ |
 | **Legible sub-tools** | `title` + `[backend]` desc on each tool; `marshal.recent` shows the real sub-tool | ✅ |
-| **Self-heal** | crashed backend respawned transparently; client never disconnects | ✅ |
+| **Self-heal** | dead backend (crash or dropped connection) reconnected with capped backoff; client never disconnects | ✅ |
 | **Call timeout** | a hung (non-exiting) backend call times out instead of stalling the client | ✅ |
 | **Singleton** | N marshal instances → 1 backend fleet (primary + thin proxies) | ✅ |
 | **Audit trail** | hash-chained, redacted, one JSONL row per tool call | ✅ |
@@ -126,8 +136,9 @@ plus backend lifecycle (`backend_ready`/`_exit`/`_add`/`_remove`):
 <details>
 <summary><strong>Known limitations (v0.1)</strong></summary>
 
-- **Timeout is per-call, not a hang-triggered restart** — a hung call times out (`MARSHAL_CALL_TIMEOUT`), but marshal does not yet kill+respawn a *persistently* unresponsive backend; only *exit* triggers respawn.
-- **stdio transport only** — no HTTP/SSE, auth, or multi-tenant (by design; use a full gateway if you need them).
+- **Timeout is per-call, not a hang-triggered restart** — a hung call times out (`MARSHAL_CALL_TIMEOUT`), but marshal does not yet kill+respawn a *persistently* unresponsive backend; only death (exit / dropped connection) triggers reconnect.
+- **Remote transport is client-side only** — marshal *connects to* HTTP/SSE MCP servers; it still serves its own clients over stdio (no HTTP listener, auth, or multi-tenant — use a full gateway for that).
+- **Remote auth is static** — bearer tokens/headers come from the config file (human-gated); no OAuth flow or token refresh.
 - **Primary death → brief gap** — proxies exit on primary loss; Claude re-spawns and one promotes (seconds).
 - **`fs.watch` is best-effort** — hot-add is a convenience, not a guarantee on every filesystem.
 
@@ -136,7 +147,7 @@ plus backend lifecycle (`backend_ready`/`_exit`/`_add`/`_remove`):
 ## Layout
 
 ```
-marshal.mjs                 # the aggregator + supervisor (zero deps, ~270 lines)
+marshal.mjs                 # the aggregator + supervisor (zero deps, ~360 lines)
 marshal.config.example.json # copy → marshal.config.json (gitignored)
 probe.mjs                   # self-heal probe
 singleton-probe.mjs         # primary/proxy singleton probe
@@ -146,7 +157,9 @@ hot-add-probe.mjs           # live config-reconcile probe
 introspect-probe.mjs        # title/description + marshal.recent observability probe
 timeout-probe.mjs           # per-call hang-timeout probe
 resources-probe.mjs         # resources + prompts aggregation probe
-fake-backend.mjs            # minimal MCP backend fixture used by the probes above
+remote-probe.mjs            # remote HTTP + SSE transport probe (connect/aggregate/route/reconnect)
+fake-backend.mjs            # minimal stdio MCP backend fixture used by the probes above
+fake-remote-server.mjs      # minimal HTTP/SSE MCP server fixture for remote-probe
 serval-probe.mjs            # isolated serval backend check
 check-fleet.mjs             # aggregate sanity (all backends namespaced)
 ```
