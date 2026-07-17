@@ -20,6 +20,9 @@ backends as supervised children — the fleet self-heals without the human in th
   (a log of values would itself be an exfil surface). Row: `{ts,backend,tool,arg_keys,ok,ms,result_bytes,prev}`.
   **Rotates** at `MARSHAL_AUDIT_MAX` (5 MB) into timestamped segments, keeping `MARSHAL_AUDIT_KEEP` (10) —
   and the chain continues unbroken across segments (next segment's first `prev` = the prior segment's tip).
+- **Hot-add / remove** — the primary watches `marshal.config.json`; edit it (add or drop a backend) and
+  marshal spawns/stops it live and refreshes tools via `list_changed` — **no restart**. Human-gated by
+  design (config file, not an agent-callable tool — which would let an injected agent spawn processes).
 - **Singleton** — Claude Code pre-warms spare sessions, so it may launch marshal more than once. The
   first becomes the **primary** (owns backends + audit, listens on `~/.marshal/marshal.sock`); any later
   one becomes a thin **proxy** (pipes stdio ⇄ the primary, spawns nothing). One backend fleet, one audit

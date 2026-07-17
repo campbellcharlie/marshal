@@ -15,9 +15,9 @@
  * Zero deps. Config: marshal.config.json ($MARSHAL_CONFIG) = { "backends": [{name,command,args}] }.
  */
 import { spawn } from 'node:child_process';
-import { readFileSync, appendFileSync, mkdirSync, rmSync, statSync, renameSync, readdirSync, unlinkSync } from 'node:fs';
+import { readFileSync, appendFileSync, mkdirSync, rmSync, statSync, renameSync, readdirSync, unlinkSync, watch } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { dirname, join, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { createServer, connect } from 'node:net';
@@ -76,6 +76,7 @@ class Backend {
       this.ready = false; this.tools = [];
       this.pending.forEach((p) => p.reject(new Error(`backend ${this.name} restarted`))); this.pending.clear();
       notifyToolsChanged(); audit({ event: 'backend_exit', backend: this.name, code });
+      if (this.stopping) { err(`backend ${this.name} removed (hot-remove)`); return; }
       err(`backend ${this.name} exited (code ${code}) — respawning in 300ms`);
       setTimeout(() => this.start(), 300);
     });
@@ -106,6 +107,18 @@ class Backend {
 let backends = [];                                         // populated only by the primary
 const publicTools = () => backends.flatMap((b) => b.tools.map(({ _orig, ...t }) => t));
 function route(name) { for (const b of backends) { const t = b.tools.find((x) => x.name === name); if (t) return { b, orig: t._orig }; } return null; }
+
+// Hot-add/remove: re-read the config and reconcile the running backends against it (primary only).
+// Edit marshal.config.json → the new backend spawns and its tools appear (via tools/list_changed);
+// a removed one is stopped. No restart. (Human-gated by design — no agent-callable "add backend" tool.)
+function reconcile() {
+  let want; try { want = JSON.parse(readFileSync(CONFIG, 'utf8')).backends || []; } catch (e) { err(`reconcile: bad config, ignored: ${e.message}`); return; }
+  const names = new Set(want.map((b) => b.name));
+  for (const c of want) if (!backends.some((b) => b.name === c.name)) { backends.push(new Backend(c)); audit({ event: 'backend_add', backend: c.name }); err(`hot-add backend: ${c.name}`); }
+  for (const b of backends) if (!names.has(b.name)) { b.stopping = true; try { b.proc.kill(); } catch {} audit({ event: 'backend_remove', backend: b.name }); }
+  backends = backends.filter((b) => names.has(b.name));
+  notifyToolsChanged();
+}
 
 // ── serve one MCP request to a given client sink ────────────────────────────────────────────────
 async function handle(req, sink) {
@@ -150,7 +163,8 @@ function runPrimary() {
     const stdioSink = (s) => process.stdout.write(s + '\n');
     sinks.add(stdioSink);
     readLines(process.stdin, (m) => handle(m, stdioSink), () => stdioSink(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'parse error' } })));
-    err(`PRIMARY up — supervising ${backendsCfg.map((b) => b.name).join(', ') || '(none)'} on ${SOCK}`);
+    let wt; try { watch(dirname(CONFIG), (_e, fn) => { if (!fn || fn === basename(CONFIG)) { clearTimeout(wt); wt = setTimeout(reconcile, 300); } }); } catch (e) { err(`config watch unavailable: ${e.message}`); }
+    err(`PRIMARY up — supervising ${backendsCfg.map((b) => b.name).join(', ') || '(none)'} on ${SOCK} (watching config for hot-add/remove)`);
   });
   const shutdown = () => { for (const b of backends) { try { b.proc.kill(); } catch {} } try { rmSync(SOCK); } catch {} process.exit(0); };
   process.on('SIGINT', shutdown); process.on('SIGTERM', shutdown);
