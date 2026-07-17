@@ -15,7 +15,7 @@
  * Zero deps. Config: marshal.config.json ($MARSHAL_CONFIG) = { "backends": [{name,command,args}] }.
  */
 import { spawn } from 'node:child_process';
-import { readFileSync, appendFileSync, mkdirSync, rmSync, statSync, renameSync, readdirSync, unlinkSync, watch } from 'node:fs';
+import { readFileSync, appendFileSync, mkdirSync, rmSync, statSync, renameSync, readdirSync, unlinkSync, watch, openSync } from 'node:fs';
 import { fileURLToPath, URL } from 'node:url';
 import { dirname, join, basename } from 'node:path';
 import { homedir } from 'node:os';
@@ -325,38 +325,64 @@ function readLines(stream, onMsg, onErr) {
 }
 
 // ── roles ───────────────────────────────────────────────────────────────────────────────────────
-function runPrimary() {
+// The backend fleet lives in a DETACHED daemon that owns the socket — NOT inside any session's process.
+// Every session-spawned marshal (the first one included) is a thin PROXY to that daemon. So when the
+// session that happened to start the daemon exits — Claude sends *its* marshal a SIGINT — only that proxy
+// dies; the daemon (in its own process group) and every other session's connection survive. That is what
+// stops the cross-session disconnect: no single session's lifecycle owns the fleet.
+const DAEMON_IDLE = Number(process.env.MARSHAL_DAEMON_IDLE || 60_000);   // daemon self-exits this long after its LAST client leaves
+
+function runDaemon() {                                      // `--daemon`: don't fight an already-running daemon
+  const probe = connect(SOCK);
+  probe.on('connect', () => { probe.destroy(); process.exit(0); });      // a live daemon owns the socket → stand down
+  probe.on('error', () => { probe.destroy(); startDaemon(); });          // stale/absent → take over
+}
+function startDaemon() {
   mkdirSync(dirname(SOCK), { recursive: true });
-  try { rmSync(SOCK); } catch {}                           // clear a stale socket (dead primary)
-  const server = createServer((conn) => {                  // each proxy connection = another client
+  try { rmSync(SOCK); } catch {}                           // clear a stale socket (dead daemon)
+  let idleTimer = null;
+  const shutdown = () => { for (const b of backends) b.stop(); try { rmSync(SOCK); } catch {} process.exit(0); };
+  const armIdle = () => { clearTimeout(idleTimer); if (sinks.size === 0) idleTimer = setTimeout(shutdown, DAEMON_IDLE); };
+  const server = createServer((conn) => {                  // each connection = one client (a session's proxy)
+    clearTimeout(idleTimer);
     const sink = (s) => { try { conn.write(s + '\n'); } catch {} };
     sinks.add(sink);
     readLines(conn, (m) => handle(m, sink));
-    conn.on('close', () => sinks.delete(sink));
-    conn.on('error', () => sinks.delete(sink));
+    conn.on('close', () => { sinks.delete(sink); armIdle(); });
+    conn.on('error', () => { sinks.delete(sink); armIdle(); });
   });
-  server.on('error', (e) => { if (e.code === 'EADDRINUSE') { err('lost primary race — becoming proxy'); tryConnect(); } else err(`socket server error: ${e.message}`); });
+  server.on('error', (e) => { if (e.code === 'EADDRINUSE') process.exit(0); else err(`daemon socket error: ${e.message}`); });
   server.listen(SOCK, () => {
-    backends = backendsCfg.map((c) => new Backend(c));     // ONLY the primary spawns backends
-    const stdioSink = (s) => process.stdout.write(s + '\n');
-    sinks.add(stdioSink);
-    readLines(process.stdin, (m) => handle(m, stdioSink), () => stdioSink(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'parse error' } })));
+    backends = backendsCfg.map((c) => new Backend(c));     // the daemon — and only the daemon — spawns backends
     let wt; try { watch(dirname(CONFIG), (_e, fn) => { if (!fn || fn === basename(CONFIG)) { clearTimeout(wt); wt = setTimeout(reconcile, 300); } }); } catch (e) { err(`config watch unavailable: ${e.message}`); }
-    err(`PRIMARY up — supervising ${backendsCfg.map((b) => b.name).join(', ') || '(none)'} on ${SOCK} (watching config for hot-add/remove)`);
+    armIdle();                                             // if nobody ever connects, self-exit after idle
+    err(`DAEMON up — supervising ${backendsCfg.map((b) => b.name).join(', ') || '(none)'} on ${SOCK} (detached; idle-exit ${DAEMON_IDLE}ms)`);
   });
-  const shutdown = () => { for (const b of backends) b.stop(); try { rmSync(SOCK); } catch {} process.exit(0); };
-  process.on('SIGINT', shutdown); process.on('SIGTERM', shutdown);
+  process.on('SIGTERM', shutdown);                         // explicit stop only; a detached daemon never receives a dying session's SIGINT
 }
-function runProxy(sock) {                                  // thin forwarder to the primary
-  err('PROXY — forwarding to the primary marshal (no backends spawned)');
+function runProxy(sock) {                                  // thin forwarder to the daemon — spawns no backends
   process.stdin.pipe(sock); sock.pipe(process.stdout);
-  sock.on('close', () => process.exit(0));                 // primary gone → exit; Claude re-spawns → one promotes
+  sock.on('close', () => process.exit(0));                 // daemon gone → exit; Claude re-spawns and re-launches/re-connects
   sock.on('error', () => process.exit(0));
   process.on('SIGINT', () => process.exit(0)); process.on('SIGTERM', () => process.exit(0));
+  err('PROXY — forwarding to the marshal daemon (no backends spawned)');
 }
-function tryConnect() {
+function spawnDaemon() {                                   // launch the detached, session-independent daemon
+  try {
+    mkdirSync(dirname(SOCK), { recursive: true });
+    let out = 'ignore'; try { out = openSync(join(dirname(SOCK), 'daemon.log'), 'a'); } catch {}
+    const child = spawn(process.execPath, [fileURLToPath(import.meta.url), '--daemon'], { detached: true, stdio: ['ignore', out, out], env: process.env });
+    child.unref();                                         // this session may exit without taking the daemon down
+  } catch (e) { err(`failed to spawn daemon: ${e.message}`); }
+}
+function tryConnect(attempt = 0) {
   const c = connect(SOCK);
   c.on('connect', () => runProxy(c));
-  c.on('error', () => runPrimary());                       // no live primary → become one
+  c.on('error', () => {
+    if (attempt === 0) spawnDaemon();                      // no daemon yet → launch one, then poll for it
+    if (attempt < 50) setTimeout(() => tryConnect(attempt + 1), 100);    // ~5s of retries while it binds
+    else { err('could not reach marshal daemon'); process.exit(1); }
+  });
 }
-tryConnect();
+if (process.argv.includes('--daemon')) runDaemon();
+else tryConnect();

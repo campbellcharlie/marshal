@@ -19,7 +19,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function marshalClient(cfgObj, tag) {
   const cfg = `/tmp/marshal-remote-${tag}-${process.pid}.json`;
   writeFileSync(cfg, JSON.stringify(cfgObj));
-  const m = spawn('node', [join(HERE, 'marshal.mjs')], { stdio: ['pipe', 'pipe', 'inherit'], env: { ...process.env, MARSHAL_CONFIG: cfg, MARSHAL_SOCK: `/tmp/marshal-remote-${tag}-${process.pid}.sock`, MARSHAL_AUDIT: `/tmp/marshal-remote-${tag}-${process.pid}.jsonl` } });
+  const m = spawn('node', [join(HERE, 'marshal.mjs')], { stdio: ['pipe', 'pipe', 'inherit'], env: { ...process.env, MARSHAL_DAEMON_IDLE: '300', MARSHAL_CONFIG: cfg, MARSHAL_SOCK: `/tmp/marshal-remote-${tag}-${process.pid}.sock`, MARSHAL_AUDIT: `/tmp/marshal-remote-${tag}-${process.pid}.jsonl` } });
   const pending = new Map(); let nextId = 1; let buf = '';
   m.stdout.setEncoding('utf8');
   m.stdout.on('data', (d) => { buf += d; let i; while ((i = buf.indexOf('\n')) >= 0) { const line = buf.slice(0, i); buf = buf.slice(i + 1); if (!line.trim()) continue; let msg; try { msg = JSON.parse(line); } catch { continue; } if (msg.id != null && pending.has(msg.id)) { const p = pending.get(msg.id); pending.delete(msg.id); p(msg); } } });

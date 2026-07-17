@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const m = spawn('node', [join(HERE, 'marshal.mjs')], { stdio: ['pipe','pipe','inherit'], env: { ...process.env, MARSHAL_SOCK: `/tmp/marshal-${process.pid}.sock`, MARSHAL_AUDIT: `/tmp/marshal-${process.pid}.jsonl` } });
+const m = spawn('node', [join(HERE, 'marshal.mjs')], { stdio: ['pipe','pipe','inherit'], env: { ...process.env, MARSHAL_SOCK: `/tmp/marshal-${process.pid}.sock`, MARSHAL_AUDIT: `/tmp/marshal-${process.pid}.jsonl`, MARSHAL_DAEMON_IDLE: '300' } });
 const pending = new Map(); let nextId = 1; let buf = '';
 m.stdout.setEncoding('utf8');
 m.stdout.on('data', (d) => {
@@ -41,11 +41,13 @@ const check = (label, cond) => { console.log(`  ${cond ? '🟩 PASS' : '🟥 FAI
   const c1 = await rpc('tools/call', { name: 'momento.get_recent', arguments: { n: 1 } });
   check(`call momento.get_recent works before kill`, c1.result && !c1.result.isError);
 
-  // Kill ONLY marshal's own child (the momento backend it spawned) — never the user's live momento.
-  const kids = execSync(`pgrep -P ${m.pid}`).toString().trim().split('\n').filter(Boolean);
-  console.log(`  … killing marshal's momento backend child (pid ${kids.join(',')}) …`);
+  // Kill ONLY this probe's momento backend — never the user's live momento. The proxy (m) spawned a
+  // detached daemon; the daemon owns the backend. So the backend is m's GRANDCHILD: m → daemon → momento.
+  const daemon = execSync(`pgrep -P ${m.pid}`).toString().trim().split('\n').filter(Boolean)[0];
+  const kids = daemon ? execSync(`pgrep -P ${daemon}`).toString().trim().split('\n').filter(Boolean) : [];
+  console.log(`  … killing this probe's momento backend (daemon ${daemon}, backend pid ${kids.join(',')}) …`);
   for (const pid of kids) { try { execSync(`kill ${pid}`); } catch {} }
-  await sleep(2000);                                       // marshal should respawn + re-init
+  await sleep(2000);                                       // daemon should respawn + re-init the backend
 
   const l2 = await rpc('tools/list', {});
   const n2 = (l2.result?.tools || []).length;
@@ -55,5 +57,6 @@ const check = (label, cond) => { console.log(`  ${cond ? '🟩 PASS' : '🟥 FAI
   check(`call works AGAIN after respawn (self-heal)`, c2.result && !c2.result.isError);
 
   console.log(ok ? '\n✅ PROBE PASSED — marshal self-heals; the client never saw a disconnect.' : '\n❌ PROBE FAILED');
-  m.kill(); process.exit(ok ? 0 : 1);
+  m.kill(); try { if (daemon) execSync(`kill ${daemon}`); } catch {}     // proxy + detached daemon
+  process.exit(ok ? 0 : 1);
 })();

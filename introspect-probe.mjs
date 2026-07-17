@@ -13,7 +13,7 @@ import { dirname, join } from 'node:path';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const cfg = `/tmp/marshal-introspect-${process.pid}.json`;
 writeFileSync(cfg, JSON.stringify({ backends: [{ name: 'fake', command: 'node', args: [join(HERE, 'fake-backend.mjs')] }] }));
-const m = spawn('node', [join(HERE, 'marshal.mjs')], { stdio: ['pipe', 'pipe', 'inherit'], env: { ...process.env, MARSHAL_CONFIG: cfg, MARSHAL_SOCK: `/tmp/marshal-introspect-${process.pid}.sock`, MARSHAL_AUDIT: `/tmp/marshal-introspect-${process.pid}.jsonl` } });
+const m = spawn('node', [join(HERE, 'marshal.mjs')], { stdio: ['pipe', 'pipe', 'inherit'], env: { ...process.env, MARSHAL_DAEMON_IDLE: '300', MARSHAL_CONFIG: cfg, MARSHAL_SOCK: `/tmp/marshal-introspect-${process.pid}.sock`, MARSHAL_AUDIT: `/tmp/marshal-introspect-${process.pid}.jsonl` } });
 const pending = new Map(); let nextId = 1; let buf = '';
 m.stdout.setEncoding('utf8');
 m.stdout.on('data', (d) => { buf += d; let i; while ((i = buf.indexOf('\n')) >= 0) { const line = buf.slice(0, i); buf = buf.slice(i + 1); if (!line.trim()) continue; let msg; try { msg = JSON.parse(line); } catch { continue; } if (msg.id != null && pending.has(msg.id)) { const p = pending.get(msg.id); pending.delete(msg.id); p(msg); } } });
