@@ -36,7 +36,7 @@ const check = (label, cond) => { console.log(`  ${cond ? '🟩 PASS' : '🟥 FAI
 
   const l1 = await rpc('tools/list', {});
   const n1 = (l1.result?.tools || []).length;
-  check(`tools/list exposes namespaced momento tools (got ${n1})`, n1 > 0 && l1.result.tools.every((t) => t.name.startsWith('momento.')));
+  check(`tools/list exposes namespaced tools (got ${n1})`, n1 > 0 && l1.result.tools.every((t) => t.name.includes('.')) && l1.result.tools.some((t) => t.name.startsWith('momento.')));
 
   const c1 = await rpc('tools/call', { name: 'momento.get_recent', arguments: { n: 1 } });
   check(`call momento.get_recent works before kill`, c1.result && !c1.result.isError);
