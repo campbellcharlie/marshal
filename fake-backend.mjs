@@ -2,7 +2,7 @@
 /**
  * fake-backend — a minimal MCP stdio server used only by marshal's probes.
  * Exposes two tools (alpha with a description, beta without). FAKE_MODE controls tools/call:
- *   ok   (default) → responds immediately
+ *   ok   (default) → responds immediately (per-call args {fail:true} → isError result; {slow:N} → delay Nms)
  *   hang           → never responds (simulates a wedged backend, to exercise marshal's per-call timeout)
  * FAKE_CAPS=1 additionally advertises resources + prompts capabilities and serves one of each
  * (to exercise marshal's resources/prompts aggregation).
@@ -27,7 +27,9 @@ process.stdin.on('data', (d) => {
     ] } });
     else if (method === 'tools/call') {
       if (MODE === 'hang') return;                                       // deliberately never answer
-      send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: `ok:${m.params?.name}` }] } });
+      const a = m.params?.arguments || {};                              // per-call knobs for stats probes
+      const reply = () => send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: `ok:${m.params?.name}` }], ...(a.fail ? { isError: true } : {}) } });
+      if (a.slow) setTimeout(reply, Number(a.slow)); else reply();
     } else if (method === 'resources/list') send({ jsonrpc: '2.0', id, result: { resources: CAPS ? [{ uri: 'fake://doc1', name: 'Doc One', mimeType: 'text/plain' }] : [] } });
     else if (method === 'resources/templates/list') send({ jsonrpc: '2.0', id, result: { resourceTemplates: CAPS ? [{ uriTemplate: 'fake://doc/{n}', name: 'Doc N' }] : [] } });
     else if (method === 'resources/read') send({ jsonrpc: '2.0', id, result: { contents: [{ uri: m.params?.uri, mimeType: 'text/plain', text: `body of ${m.params?.uri}` }] } });
