@@ -66,6 +66,23 @@ const check = (label, cond) => { console.log(`  ${cond ? '🟩 PASS' : '🟥 FAI
   check('marshal.health shows the reliability drift flag', alpha?.drift === 'reliability');
   check('marshal.health exposes an expected-latency estimate', typeof alpha?.exp_ms === 'number');
 
-  console.log(ok ? '\n✅ PROBE PASSED — marshal predicts, flags surprise, detects drift, and reports learned trust.' : '\n❌ PROBE FAILED');
+  // 6) seed-from-history: a FRESH daemon must recover learned trust from the audit BEFORE any new call
+  // (regression guard — this is exactly the seedStats()-never-called bug a restart exposed).
+  const seedAudit = `/tmp/marshal-seed-${process.pid}.jsonl`;
+  writeFileSync(seedAudit, Array.from({ length: 6 }, () => JSON.stringify({ ts: '2026-07-18T10:00:00Z', event: 'call', backend: 'pre', tool: 'x', arg_keys: [], ok: true, ms: 20, prev: '0'.repeat(64) })).join('\n') + '\n');
+  const m2 = spawn('node', [join(HERE, 'marshal.mjs')], { stdio: ['pipe', 'pipe', 'inherit'], env: { ...process.env, MARSHAL_DAEMON_IDLE: '300', MARSHAL_CONFIG: cfg, MARSHAL_SOCK: `/tmp/marshal-seed-${process.pid}.sock`, MARSHAL_AUDIT: seedAudit } });
+  const p2 = new Map(); let n2 = 1, b2 = '';
+  m2.stdout.setEncoding('utf8');
+  m2.stdout.on('data', (d) => { b2 += d; let i; while ((i = b2.indexOf('\n')) >= 0) { const l = b2.slice(0, i); b2 = b2.slice(i + 1); if (!l.trim()) continue; let o; try { o = JSON.parse(l); } catch { continue; } if (o.id != null && p2.has(o.id)) { p2.get(o.id)(o); p2.delete(o.id); } } });
+  const rpc2 = (me, pa) => new Promise((r) => { const id = n2++; p2.set(id, r); m2.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method: me, params: pa }) + '\n'); });
+  await rpc2('initialize', { protocolVersion: '2024-11-05', capabilities: {} });
+  m2.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
+  await sleep(600);
+  const health2 = JSON.parse((await rpc2('tools/call', { name: 'marshal.health' })).result?.content?.[0]?.text || '[]');
+  const pre = health2.find((h) => h.tool === 'pre.x');
+  check(`seed-from-history: fresh daemon recovers trust before any new call (pre.x n=${pre?.n})`, pre?.n === 6);
+  m2.kill();
+
+  console.log(ok ? '\n✅ PROBE PASSED — marshal predicts, flags surprise, detects drift, reports + seeds learned trust.' : '\n❌ PROBE FAILED');
   m.kill(); process.exit(ok ? 0 : 1);
 })();

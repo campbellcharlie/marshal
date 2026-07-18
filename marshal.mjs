@@ -432,6 +432,7 @@ function startDaemon() {
   });
   server.on('error', (e) => { if (e.code === 'EADDRINUSE') process.exit(0); else err(`daemon socket error: ${e.message}`); });
   server.listen(SOCK, () => {
+    seedStats();                                           // replay the audit so learned trust/expectations survive a restart
     backends = backendsCfg.map((c) => new Backend(c));     // the daemon — and only the daemon — spawns backends
     let wt; try { watch(dirname(CONFIG), (_e, fn) => { if (!fn || fn === basename(CONFIG)) { clearTimeout(wt); wt = setTimeout(reconcile, 300); } }); } catch (e) { err(`config watch unavailable: ${e.message}`); }
     armIdle();                                             // if nobody ever connects, self-exit after idle
