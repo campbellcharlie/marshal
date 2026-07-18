@@ -60,6 +60,71 @@ function audit(entry) {
   } catch (e) { err(`audit write failed: ${e.message}`); }
 }
 
+// ── per-tool rolling stats: expectation · surprise · drift · trust (daemon only) ──────────────────
+// One in-memory record per `backend.tool`, seeded from the audit log on startup and updated on every
+// routed call. Three cheap, model-free signals fall out of the same numbers:
+//   • EXPECTATION — before a call, predict ok-probability + latency; the call row logs exp_ok/exp_ms and
+//                   a `surprise` tag when the ACTUAL outcome deviates from that prior (the learning signal).
+//   • DRIFT       — when a tool's RECENT success-rate sags below its long-run baseline, emit a one-shot
+//                   `drift` audit event (debounced). Behaviour changed, not death — self-heal can't see this.
+//   • TRUST       — a volume-shrunk success rate in [0,1], surfaced via marshal.health (flag, don't gate).
+const STAT_MIN = 5;              // samples needed before we predict / judge drift (else: no basis, stay silent)
+const EWMA_A = 0.2;              // latency smoothing weight on the newest sample
+const SLOW_X = 3;                // actual > SLOW_X × expected (and past a floor) ⇒ a `slow` surprise
+const DRIFT_DROP = 0.3;          // recent success-rate this far below baseline ⇒ reliability drift
+const DRIFT_WIN = 10;            // sliding window defining "recent" behaviour
+const stats = new Map();         // `${backend}.${tool}` → { n, ok, ewma, recent[], drifted }
+let seeding = false;             // suppress drift events while replaying historical audit rows
+function statOf(key) {
+  let s = stats.get(key);
+  if (!s) { s = { n: 0, ok: 0, ewma: 0, recent: [], drifted: null }; stats.set(key, s); }
+  return s;
+}
+const trustOf = (s) => (s.ok + 1) / (s.n + 2);               // Laplace-smoothed ok-rate — never degenerate at 0/1
+function expect(key) {
+  const s = stats.get(key);
+  if (!s || s.n < STAT_MIN) return {};                       // no basis yet → predict nothing
+  return { exp_ok: Math.round(trustOf(s) * 100) / 100, exp_ms: Math.round(s.ewma) };
+}
+// Fold one outcome into the stat; return a short surprise tag (or undefined) and fire a debounced drift event.
+function record(key, backend, tool, ok, ms) {
+  const s = statOf(key);
+  const had = s.n >= STAT_MIN, priorOk = trustOf(s), priorMs = s.ewma;
+  s.n++; if (ok) s.ok++;
+  s.ewma = s.ewma ? EWMA_A * ms + (1 - EWMA_A) * s.ewma : ms;
+  s.recent.push(ok ? 1 : 0); if (s.recent.length > DRIFT_WIN) s.recent.shift();
+  let surprise;                                              // judged against the PRIOR (pre-update) expectation
+  if (had) {
+    if (ok && priorOk < 0.5) surprise = 'recover';           // expected failure, got success
+    else if (!ok && priorOk > 0.8) surprise = 'fail';        // expected success, got failure
+    else if (ok && priorMs && ms > Math.max(priorMs * SLOW_X, priorMs + 500)) surprise = 'slow';
+  }
+  if (s.n >= STAT_MIN * 2 && s.recent.length >= DRIFT_WIN) { // recent window departs from long-run baseline?
+    const recentOk = s.recent.reduce((a, b) => a + b, 0) / s.recent.length;
+    const drifting = trustOf(s) - recentOk >= DRIFT_DROP;
+    if (drifting && s.drifted !== 'reliability') { s.drifted = 'reliability'; if (!seeding) audit({ event: 'drift', backend, tool, kind: 'reliability', recent: Math.round(recentOk * 100) / 100, baseline: Math.round(trustOf(s) * 100) / 100 }); }
+    else if (!drifting && s.drifted === 'reliability') s.drifted = null;   // recovered → re-arm
+  }
+  return surprise;
+}
+// Replay existing call rows so expectations/trust survive a daemon restart (best-effort; drift muted).
+function seedStats() {
+  seeding = true;
+  let lines = []; try { lines = readFileSync(AUDIT, 'utf8').trim().split('\n').filter(Boolean); } catch {}
+  for (const l of lines) {
+    let o; try { o = JSON.parse(l); } catch { continue; }
+    if (o.event !== 'call' || !o.backend || o.backend === 'marshal' || o.tool === 'recent' || typeof o.ms !== 'number') continue;
+    record(`${o.backend}.${o.tool}`, o.backend, o.tool, !!o.ok, o.ms);
+  }
+  for (const s of stats.values()) s.drifted = null;          // start armed; history should not pre-trip drift
+  seeding = false;
+}
+function healthReport() {
+  const rows = [];
+  for (const [key, s] of stats) rows.push({ tool: key, n: s.n, trust: Math.round(trustOf(s) * 100) / 100, exp_ms: s.ewma ? Math.round(s.ewma) : null, drift: s.drifted || null });
+  return rows.sort((a, b) => a.trust - b.trust);             // least-trusted first — the ones to eyeball
+}
+
 // ── client sinks (primary serves N clients: its own stdio + each connected proxy) ────────────────
 const sinks = new Set();
 let started = false;                                       // any client finished initialize
@@ -224,6 +289,10 @@ class Backend {
     if (this.caps.prompts) {
       try { this.prompts = ((await this.req('prompts/list', {})).prompts || []).map((p) => ({ ...p, name: `${this.name}.${p.name}`, title: p.title || `${this.name} · ${p.name}`, _orig: p.name })); } catch (e) { err(`backend ${this.name} prompts/list failed: ${e.message}`); }
     }
+    // Behavioural canary: a backend that reconnects advertising FEWER tools than before changed its
+    // contract (removed/renamed a tool) — liveness self-heal can't see this. Flag it; don't block.
+    if (this.lastToolCount != null && this.tools.length < this.lastToolCount) audit({ event: 'drift', backend: this.name, kind: 'tools', was: this.lastToolCount, now: this.tools.length });
+    this.lastToolCount = this.tools.length;
     this.ready = true; this.retries = 0; audit({ event: 'backend_ready', backend: this.name, transport: this.transportKind || 'stdio', tools: this.tools.length, resources: this.resources.length, prompts: this.prompts.length });
     err(`backend ${this.name} ready (${this.transportKind || 'stdio'}): ${this.tools.length} tools, ${this.resources.length} resources, ${this.prompts.length} prompts`); notifyToolsChanged();
   }
@@ -239,6 +308,11 @@ const MARSHAL_TOOLS = [{
   title: 'marshal · recent calls',
   description: 'marshal introspection: the most recent tool calls marshal routed (from its audit log) — backend, tool, ok, ms, ts. Use to see which backend tool actually ran behind "marshal". Args: { limit?: number = 20, backend?: string }.',
   inputSchema: { type: 'object', properties: { limit: { type: 'number', description: 'max rows (default 20)' }, backend: { type: 'string', description: 'filter to one backend name' } } },
+}, {
+  name: 'marshal.health',
+  title: 'marshal · tool health',
+  description: 'marshal introspection: per-tool reliability learned from the audit log — n (calls seen), trust (0-1 volume-shrunk success rate), exp_ms (expected latency), drift (reliability | null). Least-trusted first, so a flaky or drifting backend tool surfaces at the top. Args: none.',
+  inputSchema: { type: 'object', properties: {} },
 }];
 function recentCalls(limit = 20, backend) {
   let lines = []; try { lines = readFileSync(AUDIT, 'utf8').trim().split('\n').filter(Boolean); } catch {}
@@ -247,7 +321,7 @@ function recentCalls(limit = 20, backend) {
     let o; try { o = JSON.parse(lines[i]); } catch { continue; }
     if (o.event !== 'call' || o.tool === 'recent') continue;                          // skip non-calls and marshal.recent's own rows
     if (backend && o.backend !== backend) continue;
-    rows.push({ ts: o.ts, backend: o.backend || null, tool: o.tool, ok: o.ok, ms: o.ms ?? null, ...(o.error ? { error: o.error } : {}) });
+    rows.push({ ts: o.ts, backend: o.backend || null, tool: o.tool, ok: o.ok, ms: o.ms ?? null, ...(o.surprise ? { surprise: o.surprise } : {}), ...(o.error ? { error: o.error } : {}) });
   }
   return rows;                                                                        // newest-first
 }
@@ -307,11 +381,16 @@ async function handle(req, sink) {
         audit({ event: 'call', backend: 'marshal', tool: 'recent', arg_keys: redactArgs(params.arguments), ok: true, ms: 0 });
         sink(JSON.stringify({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(rows, null, 2) }] } })); return;
       }
+      if (params.name === 'marshal.health') {                                         // learned per-tool reliability
+        audit({ event: 'call', backend: 'marshal', tool: 'health', arg_keys: [], ok: true, ms: 0 });
+        sink(JSON.stringify({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(healthReport(), null, 2) }] } })); return;
+      }
       const r = route(params.name);
       if (!r) { audit({ event: 'call', tool: params.name, ok: false, error: 'unknown_tool' }); sink(JSON.stringify({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: `Error: unknown tool "${params.name}" (backend down or restarting?)` }], isError: true } })); return; }
       const t0 = Date.now(); const arg_keys = redactArgs(params.arguments);
-      try { const res = await r.b.callTool(r.orig, params.arguments); audit({ event: 'call', backend: r.b.name, tool: r.orig, arg_keys, ok: !res?.isError, ms: Date.now() - t0, result_bytes: JSON.stringify(res).length }); sink(JSON.stringify({ jsonrpc: '2.0', id, result: res })); }
-      catch (e) { audit({ event: 'call', backend: r.b.name, tool: r.orig, arg_keys, ok: false, ms: Date.now() - t0, error: e.message }); sink(JSON.stringify({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: `Error (backend ${r.b.name}): ${e.message}` }], isError: true } })); }
+      const key = `${r.b.name}.${r.orig}`, ex = expect(key);                          // predict BEFORE the call from prior calls
+      try { const res = await r.b.callTool(r.orig, params.arguments); const ms = Date.now() - t0, ok = !res?.isError; const surprise = record(key, r.b.name, r.orig, ok, ms); audit({ event: 'call', backend: r.b.name, tool: r.orig, arg_keys, ok, ms, result_bytes: JSON.stringify(res).length, ...ex, ...(surprise ? { surprise } : {}) }); sink(JSON.stringify({ jsonrpc: '2.0', id, result: res })); }
+      catch (e) { const ms = Date.now() - t0; const surprise = record(key, r.b.name, r.orig, false, ms); audit({ event: 'call', backend: r.b.name, tool: r.orig, arg_keys, ok: false, ms, error: e.message, ...ex, ...(surprise ? { surprise } : {}) }); sink(JSON.stringify({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: `Error (backend ${r.b.name}): ${e.message}` }], isError: true } })); }
       return;
     }
     default: if (id != null) sink(JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32601, message: `method not found: ${method}` } }));
