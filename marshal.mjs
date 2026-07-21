@@ -186,7 +186,14 @@ class Backend {
   // Parse SSE frames (event:/data:) from a stream. The classic-SSE GET stream first emits an `endpoint`
   // frame naming the POST URL (which triggers init); every other frame carries a JSON-RPC message.
   feedSSE(chunk) {
-    this.sbuf += chunk; let idx;
+    // Normalize CRLF → LF: the SSE spec allows CRLF line endings and some MCP
+    // servers (e.g. mcp-go's SSE transport, which lorg uses) emit them, so an
+    // LF-only frame split ('\n\n') never matches '\r\n\r\n' — the endpoint frame
+    // and every message after it would be silently dropped, leaving the backend
+    // with 0 tools. Replacing only paired '\r\n' is safe across chunk
+    // boundaries (a lone trailing '\r' waits for its '\n') and never fabricates
+    // a frame delimiter.
+    this.sbuf += chunk; this.sbuf = this.sbuf.replace(/\r\n/g, '\n'); let idx;
     while ((idx = this.sbuf.indexOf('\n\n')) >= 0) {
       const frame = this.sbuf.slice(0, idx); this.sbuf = this.sbuf.slice(idx + 2);
       let event = 'message', data = '';
